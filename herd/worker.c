@@ -10,6 +10,12 @@ void* run_worker(void* arg) {
   int base_port_index = params.base_port_index;
   int postlist = params.postlist;
 
+  /* Sharding and replication parameters */
+  int num_servers = params.num_servers;
+  int num_shards = params.num_shards;
+  int replication_factor = params.replication_factor;
+  int server_id = params.server_id;
+
   /*
    * MICA-related checks. Note that @postlist is the largest batch size we
    * feed into MICA. The average postlist per port in a dual-port NIC should
@@ -24,7 +30,54 @@ void* run_worker(void* arg) {
   /* MICA instance id = wrkr_lid, NUMA node = 0 */
   struct mica_kv kv;
   mica_init(&kv, wrkr_lid, 0, HERD_NUM_BKTS, HERD_LOG_CAP);
-  mica_populate_fixed_len(&kv, HERD_NUM_KEYS, HERD_VALUE_SIZE);
+
+  /* Populate with sharding support - only insert keys that belong to this server */
+  printf("Worker %d (server %d): Populating MICA with sharded data. "
+         "num_servers=%d, num_shards=%d, replication=%d\n",
+         wrkr_lid, server_id, num_servers, num_shards, replication_factor);
+
+  /* Generate all keys but only insert keys that belong to this server */
+  uint128* key_arr = mica_gen_keys(HERD_NUM_KEYS);
+  struct mica_op op;
+  struct mica_resp resp;
+  unsigned long long* op_key = (unsigned long long*)&op.key;
+  int keys_inserted = 0;
+
+  for (i = 0; i < HERD_NUM_KEYS; i++) {
+    /* Generate the key */
+    op_key[0] = key_arr[i].first;
+    op_key[1] = key_arr[i].second;
+
+    /* Check if this key belongs to this server */
+    uint32_t key_bkt = ((struct mica_key*)&op.key)->bkt;
+    if (!herd_key_belongs_to_server(key_bkt, server_id, num_servers,
+                                     num_shards, replication_factor)) {
+      continue; /* Skip this key */
+    }
+
+    op.opcode = MICA_OP_PUT;
+    op.val_len = HERD_VALUE_SIZE;
+    uint8_t val = (uint8_t)(((unsigned long long*)&op.key)[1] & 0xff);
+    memset(op.value, val, HERD_VALUE_SIZE);
+
+    mica_insert_one(&kv, &op, &resp);
+  }
+
+  /* Calculate number of shards owned by this server */
+  int num_owned_shards = 0;
+  for (i = 0; i < num_shards; i++) {
+    if (herd_server_owns_shard(server_id, i, num_servers, replication_factor)) {
+      num_owned_shards++;
+    }
+  }
+
+  /* Print sharding statistics */
+  printf(
+      "Worker %d (server %d): Populated MICA instance with %d shards "
+      "(total %lld keys). Index eviction fraction = %.4f.\n",
+      wrkr_lid, server_id, num_owned_shards, kv.num_put_op,
+      (double)kv.num_index_evictions / (kv.num_put_op > 0 ? kv.num_put_op : 1));
+  free(key_arr);
 
   assert(num_server_ports < MAX_SERVER_PORTS); /* Avoid dynamic alloc */
   struct hrd_ctrl_blk* cb[MAX_SERVER_PORTS];

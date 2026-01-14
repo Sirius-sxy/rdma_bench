@@ -43,6 +43,15 @@ void* run_client(void* arg) {
   int num_server_ports = params.num_server_ports;
   int update_percentage = params.update_percentage;
 
+  /* Sharding and replication parameters */
+  int num_servers = params.num_servers;
+  int num_shards = params.num_shards;
+  int replication_factor = params.replication_factor;
+
+  /* Print sharding configuration */
+  printf("Client %d: Using sharding - num_servers=%d, num_shards=%d, replication=%d\n",
+         clt_gid, num_servers, num_shards, replication_factor);
+
   /* This is the only port used by this client */
   int ib_port_index = params.base_port_index + clt_gid % num_client_ports;
 
@@ -157,6 +166,9 @@ void* run_client(void* arg) {
     int is_update = (hrd_fastrand(&seed) % 100 < update_percentage) ? 1 : 0;
 
     /* Forge the HERD request */
+    /* In sharded mode, we need to ensure the key belongs to a shard accessible
+     * by the server this client is connected to. For now, we generate all keys
+     * and rely on server-side validation or proper client-server assignment. */
     key_i = hrd_fastrand(&seed) % HERD_NUM_KEYS; /* Choose a key */
 
     *(uint128*)req_buf = CityHash128((char*)&key_arr[key_i], 4);

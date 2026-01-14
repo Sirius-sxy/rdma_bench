@@ -31,6 +31,12 @@
 #define NUM_WORKERS 12
 #define NUM_CLIENTS 70
 
+/* Sharding and replication configuration */
+#define HERD_MAX_SERVERS 16      /* Maximum number of servers in the cluster */
+#define HERD_DEFAULT_NUM_SERVERS 4
+#define HERD_DEFAULT_NUM_SHARDS 4
+#define HERD_DEFAULT_REPLICATION 3
+
 /* Performance options */
 #define WINDOW_SIZE 32 /* Outstanding requests kept by each client */
 #define NUM_UD_QPS 1   /* Number of UD QPs per port */
@@ -52,8 +58,47 @@ struct thread_params {
   int num_client_ports;
   int update_percentage;
   int postlist;
+
+  /* Sharding and replication parameters */
+  int num_servers;       /* Total number of servers in the cluster */
+  int num_shards;        /* Total number of shards */
+  int replication_factor; /* Number of replicas per shard */
+  int server_id;         /* ID of this server (0 to num_servers-1) */
 };
 
 void* run_master(void* arg);
 void* run_worker(void* arg);
 void* run_client(void* arg);
+
+/* Sharding and replication helper functions */
+static inline int herd_get_shard_for_key(uint32_t key_bkt, int num_shards) {
+  return key_bkt % num_shards;
+}
+
+static inline int herd_get_primary_server_for_shard(int shard_id, int num_servers) {
+  return shard_id % num_servers;
+}
+
+static inline void herd_get_servers_for_shard(int shard_id, int num_servers,
+                                               int replication_factor, int* servers) {
+  for (int i = 0; i < replication_factor; i++) {
+    servers[i] = (shard_id + i) % num_servers;
+  }
+}
+
+static inline int herd_server_owns_shard(int server_id, int shard_id,
+                                          int num_servers, int replication_factor) {
+  for (int i = 0; i < replication_factor; i++) {
+    if (((shard_id + i) % num_servers) == server_id) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static inline int herd_key_belongs_to_server(uint32_t key_bkt, int server_id,
+                                               int num_servers, int num_shards,
+                                               int replication_factor) {
+  int shard_id = herd_get_shard_for_key(key_bkt, num_shards);
+  return herd_server_owns_shard(server_id, shard_id, num_servers, replication_factor);
+}

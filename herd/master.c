@@ -11,12 +11,28 @@ void* run_master(void* arg) {
   int num_server_ports = master_params.num_server_ports;
   int base_port_index = master_params.base_port_index;
 
+  /* Sharding and replication parameters */
+  int num_servers = master_params.num_servers;
+  int num_shards = master_params.num_shards;
+  int replication_factor = master_params.replication_factor;
+  int server_id = master_params.server_id;
+
+  /* Calculate number of shards owned by this server */
+  int num_owned_shards = 0;
+  for (i = 0; i < num_shards; i++) {
+    if (herd_server_owns_shard(server_id, i, num_servers, replication_factor)) {
+      num_owned_shards++;
+    }
+  }
+
   hrd_red_printf(
-      "Running HERD master with num_server_ports = %d "
-      "base_port_index = %d, RR_SIZE = %d MB, RR use fraction = %.2f\n",
-      num_server_ports, base_port_index, RR_SIZE / M_1,
+      "Running HERD master (server_id=%d/%d) with num_server_ports = %d "
+      "base_port_index = %d, RR_SIZE = %d MB, RR use fraction = %.2f\n"
+      "Sharding config: num_shards=%d, replication=%d, owned_shards=%d\n",
+      server_id, num_servers, num_server_ports, base_port_index, RR_SIZE / M_1,
       (double)sizeof(struct mica_op) * NUM_CLIENTS * NUM_WORKERS * WINDOW_SIZE /
-          RR_SIZE);
+          RR_SIZE,
+      num_shards, replication_factor, num_owned_shards);
 
   /*
    * Create one control block per port. Each control block has enough QPs
