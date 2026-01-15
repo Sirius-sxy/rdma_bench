@@ -36,7 +36,7 @@ int* get_random_permutation(int n, int clt_gid, uint64_t* seed) {
 }
 
 void* run_client(void* arg) {
-  int i;
+  int i, s;
   struct thread_params params = *(struct thread_params*)arg;
   int clt_gid = params.id; /* Global ID of this client thread */
   int num_client_ports = params.num_client_ports;
@@ -49,62 +49,81 @@ void* run_client(void* arg) {
   int replication_factor = params.replication_factor;
 
   /* Print sharding configuration */
-  printf("Client %d: Using sharding - num_servers=%d, num_shards=%d, replication=%d\n",
+  printf("Client %d: Multi-server routing enabled - "
+         "num_servers=%d, num_shards=%d, replication=%d\n",
          clt_gid, num_servers, num_shards, replication_factor);
 
   /* This is the only port used by this client */
   int ib_port_index = params.base_port_index + clt_gid % num_client_ports;
 
   /*
-   * The virtual server port index to connect to. This index is relative to
-   * the server's base_port_index (that the client does not know).
+   * Create multiple control blocks and connected QPs - one for each server.
+   * We need num_servers connected QPs to route requests to any server.
    */
-  int srv_virt_port_index = clt_gid % num_server_ports;
+  assert(num_servers <= HERD_MAX_SERVERS);
+  struct hrd_ctrl_blk* cb[HERD_MAX_SERVERS];
+  struct hrd_qp_attr* mstr_qp[HERD_MAX_SERVERS];
 
-  /*
-   * TODO: The client creates a connected buffer because the libhrd API
-   * requires a buffer when creating connected queue pairs. This should be
-   * fixed in the API.
-   */
-  struct hrd_ctrl_blk* cb = hrd_ctrl_blk_init(
-      clt_gid,                /* local_hid */
-      ib_port_index, -1,      /* port_index, numa_node_id */
-      1, 1,                   /* #conn qps, uc */
-      NULL, 4096, -1,         /* prealloc conn buf, buf size, key */
-      1, DGRAM_BUF_SIZE, -1); /* num_dgram_qps, dgram_buf_size, key */
+  /* Create one control block for all connections (shared resources) */
+  cb[0] = hrd_ctrl_blk_init(
+      clt_gid,                   /* local_hid */
+      ib_port_index, -1,         /* port_index, numa_node_id */
+      num_servers, 1,            /* #conn qps = num_servers, uc */
+      NULL, 4096, -1,            /* prealloc conn buf, buf size, key */
+      1, DGRAM_BUF_SIZE, -1);    /* num_dgram_qps, dgram_buf_size, key */
 
-  char mstr_qp_name[HRD_QP_NAME_SIZE];
-  sprintf(mstr_qp_name, "master-%d-%d", srv_virt_port_index, clt_gid);
-
+  /* Publish client QPs once */
   char clt_conn_qp_name[HRD_QP_NAME_SIZE];
-  sprintf(clt_conn_qp_name, "client-conn-%d", clt_gid);
   char clt_dgram_qp_name[HRD_QP_NAME_SIZE];
   sprintf(clt_dgram_qp_name, "client-dgram-%d", clt_gid);
+  hrd_publish_dgram_qp(cb[0], 0, clt_dgram_qp_name);
 
-  hrd_publish_conn_qp(cb, 0, clt_conn_qp_name);
-  hrd_publish_dgram_qp(cb, 0, clt_dgram_qp_name);
-  printf("main: Client %s published conn and dgram. Waiting for master %s\n",
-         clt_conn_qp_name, mstr_qp_name);
+  /* Connect to all servers */
+  printf("Client %d: Connecting to %d servers...\n", clt_gid, num_servers);
 
-  struct hrd_qp_attr* mstr_qp = NULL;
-  while (mstr_qp == NULL) {
-    mstr_qp = hrd_get_published_qp(mstr_qp_name);
-    if (mstr_qp == NULL) {
-      usleep(200000);
+  for (s = 0; s < num_servers; s++) {
+    /* Publish this client's connected QP for server s */
+    sprintf(clt_conn_qp_name, "client-conn-s%d-%d", s, clt_gid);
+    hrd_publish_conn_qp(cb[0], s, clt_conn_qp_name);
+
+    /*
+     * Calculate which virtual port index to use on this server.
+     * We round-robin clients across server ports.
+     */
+    int srv_virt_port_index = clt_gid % num_server_ports;
+
+    char mstr_qp_name[HRD_QP_NAME_SIZE];
+    sprintf(mstr_qp_name, "master-s%d-%d-%d", s, srv_virt_port_index, clt_gid);
+
+    /* Wait for server's master QP */
+    mstr_qp[s] = NULL;
+    while (mstr_qp[s] == NULL) {
+      mstr_qp[s] = hrd_get_published_qp(mstr_qp_name);
+      if (mstr_qp[s] == NULL) {
+        usleep(200000);
+      }
     }
+
+    printf("Client %d: Found server %d master %s. Connecting QP %d...\n",
+           clt_gid, s, mstr_qp_name, s);
+    hrd_connect_qp(cb[0], s, mstr_qp[s]);
+    hrd_wait_till_ready(mstr_qp_name);
   }
 
-  printf("main: Client %s found master! Connecting..\n", clt_conn_qp_name);
-  hrd_connect_qp(cb, 0, mstr_qp);
-  hrd_wait_till_ready(mstr_qp_name);
+  printf("Client %d: Successfully connected to all %d servers!\n",
+         clt_gid, num_servers);
 
   /* Start the real work */
   uint64_t seed = 0xdeadbeef;
   int* key_arr = get_random_permutation(HERD_NUM_KEYS, clt_gid, &seed);
   int key_i, ret;
 
-  /* Some tracking info */
-  int ws[NUM_WORKERS] = {0}; /* Window slot to use for a worker */
+  /* Track window slots per server per worker */
+  int ws[HERD_MAX_SERVERS][NUM_WORKERS];
+  memset(ws, 0, sizeof(ws));
+
+  /* Request routing statistics */
+  long long requests_per_server[HERD_MAX_SERVERS] = {0};
 
   struct mica_op* req_buf = memalign(4096, sizeof(*req_buf));
   assert(req_buf != NULL);
@@ -118,15 +137,14 @@ void* run_client(void* arg) {
 
   long long rolling_iter = 0; /* For throughput measurement */
   long long nb_tx = 0;        /* Total requests performed or queued */
-  int wn = 0;                 /* Worker number */
 
   struct timespec start, end;
   clock_gettime(CLOCK_REALTIME, &start);
 
   /* Fill the RECV queue */
   for (i = 0; i < WINDOW_SIZE; i++) {
-    hrd_post_dgram_recv(cb->dgram_qp[0], (void*)cb->dgram_buf, DGRAM_BUF_SIZE,
-                        cb->dgram_buf_mr->lkey);
+    hrd_post_dgram_recv(cb[0]->dgram_qp[0], (void*)cb[0]->dgram_buf,
+                        DGRAM_BUF_SIZE, cb[0]->dgram_buf_mr->lkey);
   }
 
   while (1) {
@@ -134,10 +152,18 @@ void* run_client(void* arg) {
       clock_gettime(CLOCK_REALTIME, &end);
       double seconds = (end.tv_sec - start.tv_sec) +
                        (double)(end.tv_nsec - start.tv_nsec) / 1000000000;
-      printf("main: Client %d: %.2f IOPS. nb_tx = %lld\n", clt_gid,
-             K_512 / seconds, nb_tx);
+
+      /* Print per-server routing statistics */
+      printf("Client %d: %.2f IOPS. nb_tx = %lld. Routing: ",
+             clt_gid, K_512 / seconds, nb_tx);
+      for (s = 0; s < num_servers; s++) {
+        printf("S%d=%.1f%% ", s,
+               100.0 * requests_per_server[s] / K_512);
+      }
+      printf("\n");
 
       rolling_iter = 0;
+      memset(requests_per_server, 0, sizeof(requests_per_server));
 
       clock_gettime(CLOCK_REALTIME, &start);
     }
@@ -146,36 +172,57 @@ void* run_client(void* arg) {
     if (nb_tx % WINDOW_SIZE == 0 && nb_tx > 0) {
       for (i = 0; i < WINDOW_SIZE; i++) {
         recv_sgl[i].length = DGRAM_BUF_SIZE;
-        recv_sgl[i].lkey = cb->dgram_buf_mr->lkey;
-        recv_sgl[i].addr = (uintptr_t)&cb->dgram_buf[0];
+        recv_sgl[i].lkey = cb[0]->dgram_buf_mr->lkey;
+        recv_sgl[i].addr = (uintptr_t)&cb[0]->dgram_buf[0];
 
         recv_wr[i].sg_list = &recv_sgl[i];
         recv_wr[i].num_sge = 1;
         recv_wr[i].next = (i == WINDOW_SIZE - 1) ? NULL : &recv_wr[i + 1];
       }
 
-      ret = ibv_post_recv(cb->dgram_qp[0], &recv_wr[0], &bad_recv_wr);
+      ret = ibv_post_recv(cb[0]->dgram_qp[0], &recv_wr[0], &bad_recv_wr);
       CPE(ret, "ibv_post_recv error", ret);
     }
 
     if (nb_tx % WINDOW_SIZE == 0 && nb_tx > 0) {
-      hrd_poll_cq(cb->dgram_recv_cq[0], WINDOW_SIZE, wc);
+      hrd_poll_cq(cb[0]->dgram_recv_cq[0], WINDOW_SIZE, wc);
     }
 
-    wn = hrd_fastrand(&seed) % NUM_WORKERS; /* Choose a worker */
+    /* Generate a random key */
+    key_i = hrd_fastrand(&seed) % HERD_NUM_KEYS;
     int is_update = (hrd_fastrand(&seed) % 100 < update_percentage) ? 1 : 0;
 
     /* Forge the HERD request */
-    /* In sharded mode, we need to ensure the key belongs to a shard accessible
-     * by the server this client is connected to. For now, we generate all keys
-     * and rely on server-side validation or proper client-server assignment. */
-    key_i = hrd_fastrand(&seed) % HERD_NUM_KEYS; /* Choose a key */
-
     *(uint128*)req_buf = CityHash128((char*)&key_arr[key_i], 4);
     req_buf->opcode = is_update ? HERD_OP_PUT : HERD_OP_GET;
     req_buf->val_len = is_update ? HERD_VALUE_SIZE : -1;
 
-    /* Forge the RDMA work request */
+    /*
+     * ==================== KEY ROUTING LOGIC ====================
+     * Calculate which server should handle this key based on sharding.
+     */
+    uint32_t key_bkt = ((struct mica_key*)req_buf)->bkt;
+    int shard_id = herd_get_shard_for_key(key_bkt, num_shards);
+
+    /* Get the primary server for this shard (or any replica for reads) */
+    int target_server;
+    if (replication_factor == 1) {
+      /* Simple case: one replica per shard */
+      target_server = herd_get_primary_server_for_shard(shard_id, num_servers);
+    } else {
+      /* Multiple replicas: for now, always use primary */
+      /* TODO: Load balance reads across replicas */
+      target_server = herd_get_primary_server_for_shard(shard_id, num_servers);
+    }
+
+    assert(target_server >= 0 && target_server < num_servers);
+    requests_per_server[target_server]++;
+
+    /* Choose a random worker on the target server */
+    int wn = hrd_fastrand(&seed) % NUM_WORKERS;
+    /* ==================== END ROUTING LOGIC ==================== */
+
+    /* Forge the RDMA work request to the target server */
     sgl.length = is_update ? HERD_PUT_REQ_SIZE : HERD_GET_REQ_SIZE;
     sgl.addr = (uint64_t)(uintptr_t)req_buf;
 
@@ -186,21 +233,26 @@ void* run_client(void* arg) {
 
     wr.send_flags = (nb_tx & UNSIG_BATCH_) == 0 ? IBV_SEND_SIGNALED : 0;
     if ((nb_tx & UNSIG_BATCH_) == UNSIG_BATCH_) {
-      hrd_poll_cq(cb->conn_cq[0], 1, wc);
+      hrd_poll_cq(cb[0]->conn_cq[target_server], 1, wc);
     }
     wr.send_flags |= IBV_SEND_INLINE;
 
-    wr.wr.rdma.remote_addr = mstr_qp->buf_addr + OFFSET(wn, clt_gid, ws[wn]) *
-                                                     sizeof(struct mica_op);
-    wr.wr.rdma.rkey = mstr_qp->rkey;
+    /*
+     * Use the target server's remote address and the correct window slot.
+     * Note: We use a per-server, per-worker window slot tracker.
+     */
+    wr.wr.rdma.remote_addr = mstr_qp[target_server]->buf_addr +
+                             OFFSET(wn, clt_gid, ws[target_server][wn]) *
+                             sizeof(struct mica_op);
+    wr.wr.rdma.rkey = mstr_qp[target_server]->rkey;
 
-    ret = ibv_post_send(cb->conn_qp[0], &wr, &bad_send_wr);
+    /* Post SEND using the connected QP for target_server */
+    ret = ibv_post_send(cb[0]->conn_qp[target_server], &wr, &bad_send_wr);
     CPE(ret, "ibv_post_send error", ret);
-    // printf("Client %d: sending request index %lld\n", clt_gid, nb_tx);
 
     rolling_iter++;
     nb_tx++;
-    HRD_MOD_ADD(ws[wn], WINDOW_SIZE);
+    HRD_MOD_ADD(ws[target_server][wn], WINDOW_SIZE);
   }
 
   return NULL;
