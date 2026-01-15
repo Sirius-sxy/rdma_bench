@@ -20,6 +20,13 @@ int main(int argc, char* argv[]) {
   int num_threads = -1;
   int is_client = -1, machine_id = -1, postlist = -1, update_percentage = -1;
   int base_port_index = -1, num_server_ports = -1, num_client_ports = -1;
+
+  /* Sharding and replication parameters */
+  int num_servers = HERD_DEFAULT_NUM_SERVERS;
+  int num_shards = HERD_DEFAULT_NUM_SHARDS;
+  int replication_factor = HERD_DEFAULT_REPLICATION;
+  int server_id = 0; /* Default to server 0 */
+
   struct thread_params* param_arr;
   pthread_t* thread_arr;
 
@@ -33,11 +40,15 @@ int main(int argc, char* argv[]) {
       {.name = "update-percentage", .has_arg = 1, .val = 'u'},
       {.name = "machine-id", .has_arg = 1, .val = 'm'},
       {.name = "postlist", .has_arg = 1, .val = 'p'},
+      {.name = "num-servers", .has_arg = 1, .val = 'S'},
+      {.name = "num-shards", .has_arg = 1, .val = 'H'},
+      {.name = "replication-factor", .has_arg = 1, .val = 'R'},
+      {.name = "server-id", .has_arg = 1, .val = 'I'},
       {0}};
 
   /* Parse and check arguments */
   while (1) {
-    c = getopt_long(argc, argv, "M:t:b:N:n:c:u:m:p", opts, NULL);
+    c = getopt_long(argc, argv, "M:t:b:N:n:c:u:m:p:S:H:R:I:", opts, NULL);
     if (c == -1) {
       break;
     }
@@ -70,6 +81,18 @@ int main(int argc, char* argv[]) {
       case 'p':
         postlist = atoi(optarg);
         break;
+      case 'S':
+        num_servers = atoi(optarg);
+        break;
+      case 'H':
+        num_shards = atoi(optarg);
+        break;
+      case 'R':
+        replication_factor = atoi(optarg);
+        break;
+      case 'I':
+        server_id = atoi(optarg);
+        break;
       default:
         printf("Invalid argument %d\n", c);
         assert(false);
@@ -80,11 +103,21 @@ int main(int argc, char* argv[]) {
   assert(base_port_index >= 0 && base_port_index <= 8);
   assert(num_server_ports >= 1 && num_server_ports <= 8);
 
+  /* Sharding parameter validation */
+  assert(num_servers >= 1 && num_servers <= HERD_MAX_SERVERS);
+  assert(num_shards >= 1);
+  assert(replication_factor >= 1 && replication_factor <= num_servers);
+  assert(server_id >= 0 && server_id < num_servers);
+
   /* Handle the master process specially */
   if (is_master == 1) {
     struct thread_params master_params;
     master_params.num_server_ports = num_server_ports;
     master_params.base_port_index = base_port_index;
+    master_params.num_servers = num_servers;
+    master_params.num_shards = num_shards;
+    master_params.replication_factor = replication_factor;
+    master_params.server_id = server_id;
 
     pthread_t master_thread;
     pthread_create(&master_thread, NULL, run_master, (void*)&master_params);
@@ -118,6 +151,12 @@ int main(int argc, char* argv[]) {
 
   for (i = 0; i < num_threads; i++) {
     param_arr[i].postlist = postlist;
+
+    /* Set sharding parameters for all threads */
+    param_arr[i].num_servers = num_servers;
+    param_arr[i].num_shards = num_shards;
+    param_arr[i].replication_factor = replication_factor;
+    param_arr[i].server_id = server_id;
 
     if (is_client) {
       param_arr[i].id = (machine_id * num_threads) + i;

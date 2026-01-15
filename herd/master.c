@@ -11,12 +11,28 @@ void* run_master(void* arg) {
   int num_server_ports = master_params.num_server_ports;
   int base_port_index = master_params.base_port_index;
 
+  /* Sharding and replication parameters */
+  int num_servers = master_params.num_servers;
+  int num_shards = master_params.num_shards;
+  int replication_factor = master_params.replication_factor;
+  int server_id = master_params.server_id;
+
+  /* Calculate number of shards owned by this server */
+  int num_owned_shards = 0;
+  for (i = 0; i < num_shards; i++) {
+    if (herd_server_owns_shard(server_id, i, num_servers, replication_factor)) {
+      num_owned_shards++;
+    }
+  }
+
   hrd_red_printf(
-      "Running HERD master with num_server_ports = %d "
-      "base_port_index = %d, RR_SIZE = %d MB, RR use fraction = %.2f\n",
-      num_server_ports, base_port_index, RR_SIZE / M_1,
+      "Running HERD master (server_id=%d/%d) with num_server_ports = %d "
+      "base_port_index = %d, RR_SIZE = %d MB, RR use fraction = %.2f\n"
+      "Sharding config: num_shards=%d, replication=%d, owned_shards=%d\n",
+      server_id, num_servers, num_server_ports, base_port_index, RR_SIZE / M_1,
       (double)sizeof(struct mica_op) * NUM_CLIENTS * NUM_WORKERS * WINDOW_SIZE /
-          RR_SIZE);
+          RR_SIZE,
+      num_shards, replication_factor, num_owned_shards);
 
   /*
    * Create one control block per port. Each control block has enough QPs
@@ -41,22 +57,24 @@ void* run_master(void* arg) {
     /* Zero out the request buffer */
     memset((void*)cb[i]->conn_buf, 0, RR_SIZE);
 
-    /* Register all created QPs - only some will get used! */
+    /* Register all created QPs - include server_id for multi-server support */
     for (j = 0; j < NUM_CLIENTS; j++) {
       char srv_name[HRD_QP_NAME_SIZE];
-      sprintf(srv_name, "master-%d-%d", i, j);
+      sprintf(srv_name, "master-s%d-%d-%d", server_id, i, j);
       hrd_publish_conn_qp(cb[i], j, srv_name);
     }
 
-    printf("main: Master published all QPs on port %d\n", ib_port_index);
+    printf("main: Master (server %d) published all QPs on port %d\n",
+           server_id, ib_port_index);
   }
 
   hrd_red_printf("main: Master published all QPs. Waiting for clients..\n");
 
   for (i = 0; i < NUM_CLIENTS; i++) {
     char clt_conn_qp_name[HRD_QP_NAME_SIZE];
-    sprintf(clt_conn_qp_name, "client-conn-%d", i);
-    printf("main: Master waiting for client %s\n", clt_conn_qp_name);
+    sprintf(clt_conn_qp_name, "client-conn-s%d-%d", server_id, i);
+    printf("main: Master (server %d) waiting for client %s\n",
+           server_id, clt_conn_qp_name);
 
     struct hrd_qp_attr* clt_qp = NULL;
     while (clt_qp == NULL) {
@@ -66,8 +84,8 @@ void* run_master(void* arg) {
       }
     }
 
-    printf("main: Master found client %d of %d clients. Connecting..\n", i,
-           NUM_CLIENTS);
+    printf("main: Master (server %d) found client %d of %d clients. Connecting..\n",
+           server_id, i, NUM_CLIENTS);
 
     /* Calculate the control block and QP to use for this client */
     int cb_i = i % num_server_ports;
@@ -76,7 +94,7 @@ void* run_master(void* arg) {
     hrd_connect_qp(cb[cb_i], qp_i, clt_qp);
 
     char mstr_qp_name[HRD_QP_NAME_SIZE];
-    sprintf(mstr_qp_name, "master-%d-%d", cb_i, qp_i);
+    sprintf(mstr_qp_name, "master-s%d-%d-%d", server_id, cb_i, qp_i);
     hrd_publish_ready(mstr_qp_name);
   }
 
